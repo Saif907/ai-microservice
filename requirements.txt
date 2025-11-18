@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+# The new, modern Google Gen AI SDK
+google-genai
+# Other providers if needed
+anthropic
+openai
+# Utilities
+httpx
+typing-extensions
