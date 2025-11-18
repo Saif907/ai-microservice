@@ -1,7 +1,7 @@
 import json
 import os
 import asyncio 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from datetime import datetime
 from pydantic import BaseModel
 import os
@@ -14,69 +14,100 @@ from google.genai.errors import APIError
 # Import local models
 from app.models import TradeCreate, Message
 
+# Define the Intent Classification model (must match the enum below)
+class IntentResponse(BaseModel):
+    intent: Literal["LOG_TRADE", "REVIEW_ANALYSIS", "NEWS_MARKET", "PLAN_STRATEGY", "OTHER"]
+
 class AIService:
     """
     AI Service using the modern google-genai SDK (Gemini 2.5).
-    Enables Google Search grounding for real-time market data and handles 
-    trade extraction and analysis based on user intent.
+    Implements a fast, sequential classification flow to differentiate intents.
     """
 
     def __init__(self):
-        # NOTE: API key is loaded from the OS environment via main.py/dotenv
         api_key = os.environ.get("GEMINI_API_KEY")
         
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing. Cannot initialize AI client.")
         
-        # Initialize the new Client
         self.client = genai.Client(api_key=api_key)
         self.model_id = "gemini-2.5-flash"
+        
+        # New config for ultra-fast classification
+        self.classification_config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=IntentResponse
+        )
+
+
+    async def classify_intent(self, text: str) -> str:
+        """
+        STAGE 1: Fast classification step to determine user intent.
+        """
+        
+        prompt = f"""
+        Analyze the user's input and classify their PRIMARY intent using only one of the following categories:
+        - LOG_TRADE (Explicitly reporting a completed buy/sell action)
+        - REVIEW_ANALYSIS (Asking to summarize or analyze past performance)
+        - NEWS_MARKET (Asking about current price, news, or market conditions)
+        - PLAN_STRATEGY (Asking for advice, future plans, or what to look for)
+        - OTHER (Greetings, general chat, or unclear requests)
+        
+        Return ONLY a JSON object: {{"intent": "CATEGORY"}}
+        
+        Input: "{text}"
+        """
+        
+        try:
+            # Classification is very fast and should use minimal tokens
+            response = await self.client.aio.models.generate_content(
+                model=self.model_id, 
+                contents=prompt,
+                config=self.classification_config,
+            )
+            
+            data = json.loads(response.text)
+            return data.get("intent", "OTHER").upper()
+        except Exception as e:
+            print(f"Classification failed: {e}")
+            return "OTHER"
+
 
     async def extract_trade_from_text(self, text: str) -> Optional[TradeCreate]:
         """
-        Extracts trade details with a highly specialized prompt using FEW-SHOT EXAMPLES
-        to correctly classify intent (Logging vs Planning/News).
+        STAGE 2: Only proceeds with extraction if STAGE 1 determined the intent was LOG_TRADE.
         """
+        
+        # --- Sequential Intent Check (The key fix for accuracy/speed) ---
+        intent = await self.classify_intent(text)
+        if intent != "LOG_TRADE":
+            # Exit early if intent is not logging, drastically improving accuracy and avoiding cost/latency.
+            return None 
+
+        # --- Stage 2: Detailed Extraction (Only runs if intent is LOG_TRADE) ---
         today = datetime.now().strftime('%Y-%m-%d')
         MAX_RETRIES = 3
         
-        # FEW-SHOT PROMPTING: Showing the model exactly what to do is more powerful than just telling it.
         prompt = f"""
-        You are an EXTREMELY STRICT Data Extraction Agent.
-        Your task is to identify COMPLETED TRADING ACTIONS for a database log.
-
-        Current Date: {today}
-
-        [EXAMPLES OF INPUTS THAT MUST RETURN NULL]
-        - "What is the news for TSLA?" -> null (News query)
-        - "Should I buy NVDA?" -> null (Asking for advice)
-        - "I am planning to buy AAPL at 200" -> null (Future plan, not a completed trade)
-        - "Review my last week's trades" -> null (Analysis request)
-        - "AAPL is going up" -> null (Market commentary)
-        - "If SPY hits 500 I will sell" -> null (Conditional/Future)
-
-        [EXAMPLES OF INPUTS THAT MUST BE EXTRACTED]
-        - "I bought 10 shares of TSLA at 200" -> {{ "ticker": "TSLA", "entry_price": 200, "quantity": 10, "entry_date": "{today}", ... }}
-        - "Sold AAPL just now at 150" -> {{ "ticker": "AAPL", "exit_price": 150, ... }}
-        - "Long NVDA 500 entry, 550 exit, 5 shares" -> {{ "ticker": "NVDA", "entry_price": 500, "exit_price": 550, "quantity": 5, ... }}
-
-        [YOUR INSTRUCTIONS]
-        1. **Analyze User Input:** "{text}"
-        2. **Check Intent:** Does this describe a COMPLETED or EXECUTED trade?
-           - IF YES -> Return the JSON object.
-           - IF NO (News, Plan, Question, Review) -> Return the JSON value: null
-        3. **Defaults:** If quantity is missing in a valid trade, default to 1.
+        You are an EXTREMELY STRICT Data Extraction Agent. 
+        Your task is to extract the details of the COMPLETED trade described below.
+        
+        Context: Today is {today}.
+        User input: "{text}"
+        
+        Rules:
+        1. Fill the TradeCreate schema completely.
+        2. If quantity is missing, default to 1.
         """
 
         for attempt in range(MAX_RETRIES):
             try:
-                # Enforce JSON output matching the TradeCreate schema
                 response = await self.client.aio.models.generate_content(
                     model=self.model_id,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
-                        response_schema=TradeCreate, # Pass the Pydantic model directly
+                        response_schema=TradeCreate,
                     ),
                 )
     
@@ -85,17 +116,16 @@ class AIService:
                 return None
                 
             except APIError as e:
-                # Handle 503 (Service Unavailable) explicitly
                 if "503 UNAVAILABLE" in str(e) and attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s...
+                    wait_time = 2 ** attempt
                     print(f"Extraction Error: {e}. Retrying in {wait_time}s...")
                     await asyncio.sleep(wait_time)
                 else:
                     print(f"Extraction Error: Final attempt failed or unrecoverable error: {e}")
-                    raise # Re-raise the error for FastAPI to catch
+                    raise
             except Exception as e:
                 print(f"Extraction Error: {e}")
-                raise # Re-raise the error for FastAPI to catch
+                raise
 
 
     async def generate_chat_response(
@@ -110,7 +140,6 @@ class AIService:
         """
         MAX_RETRIES = 3
         
-        # 1. Prepare Context (Trade History - Internal Knowledge)
         trade_context = "No previous trades available."
         if trade_history:
             trade_context = json.dumps(trade_history[-20:], indent=2, default=str)
@@ -119,28 +148,20 @@ class AIService:
         You are an expert Trading Journal AI Assistant. Your goal is to be helpful, accurate, and context-aware.
 
         [YOUR DATA SOURCES]
-        1. **Internal Trade History:**
-           {trade_context}
+        1. **Internal Trade History:** {trade_context}
         2. **Google Search Tool:** (Available for real-time info)
 
         [DECISION PROTOCOL - HOW TO HANDLE REQUESTS]
         
-        CASE 1: User asks about **NEWS, MARKET DATA, or CURRENT EVENTS** (e.g., "Why is TSLA down?", "AAPL price?").
-        -> **ACTION:** You MUST use the `Google Search` tool. Do not rely on internal knowledge for current prices.
+        This model is responsible for the CONVERSATION. The companion extraction model runs separately.
         
-        CASE 2: User asks to **REVIEW, ANALYZE, or SUMMARIZE** their own trading (e.g., "How is my win rate?", "Review my last trade").
-        -> **ACTION:** Analyze the **Internal Trade History** provided above. Do NOT search the web.
-        
-        CASE 3: User is **LOGGING A TRADE** (e.g., "I bought AAPL", "Sold NVDA").
-        -> **ACTION:** Simply acknowledge the trade enthusiastically and perhaps comment on how it fits their history (e.g., "Nice! Adding that to your journal."). Do NOT search the web.
-        
-        CASE 4: User asks for **PLANNING/STRATEGY** (e.g., "What should I look for in SPY?").
-        -> **ACTION:** You may use `Google Search` to find current key levels or news events to watch, then combine that with general advice.
+        1. **NEWS/MARKET & PLANNING:** If the user is asking about current data or strategy planning, use the `Google Search` tool.
+        2. **REVIEW/ANALYSIS:** If the user is asking about their past performance, analyze the **Internal Trade History**.
+        3. **LOGGING/OTHER:** Respond conversationally. If a trade was just logged, acknowledge it and comment on the performance (e.g., "Great win!").
 
         **General Rule:** Be concise. If you use Search, mention that you checked live data.
         """
 
-        # 2. Convert Chat History to new SDK format
         contents = []
         for msg in chat_history[-6:]:
             role = "model" if msg.role == "assistant" else "user"
@@ -152,7 +173,6 @@ class AIService:
 
         for attempt in range(MAX_RETRIES):
             try:
-                # 3. Generate Content with Search Tool enabled
                 response = await self.client.aio.models.generate_content(
                     model=self.model_id,
                     contents=contents,
@@ -163,10 +183,8 @@ class AIService:
                     )
                 )
 
-                # 4. Check for Grounding (Did it use search?)
                 is_grounded = False
                 if response.candidates and response.candidates[0].grounding_metadata:
-                    # Robust check for search entry point
                     if hasattr(response.candidates[0].grounding_metadata, 'search_entry_point') and \
                        response.candidates[0].grounding_metadata.search_entry_point is not None:
                         is_grounded = True
